@@ -1,0 +1,572 @@
+
+## 介绍
+django-java是一个Java语言的mongodb文档对象映射框架，主要目标是简化文档设计，提高开发效率。适用于文档结构繁杂且更新文档需求较多的场景，比如游戏服务器或者一些信息管理后台等。
+
+#### 主要特性
+- 支持结合spring boot，配置简单，快速上手。
+
+- **一个Java文档类对应一个mongodb的collection，每个文档类都有一个key，key相当于collection的唯一索引，你可以根据key值来进行简单的CRUD操作，另外也支持用Bson来描述复杂的Filter条件。**
+
+- **支持部分更新。文档对象上会记录对它的修改，文档保存入库时自动生成更新语句，只更新修改了的部分，而不是完全更新整个文档。由此你可以设计最合理的文档结构，而不用担心更新文档有性能问题。**
+
+- **文档类使用专用的类型系统，这会给文档类添加一些各方面的限制，比如字段类型选择、对象创建方式等，另一方面也能让文档类的定义更加规范。**
+
+- 支持文档缓存层，可以根据key缓存文档，默认用Caffine Cache实现，你也可以自定义其他的实现方式。
+
+- 提供常用数据库操作的API，包括单文档CRUD， 批量CRUD、并发控制(CAS、单字段自增等)、在事务中执行一组操作等
+
+- 可以获取mongodb原生驱动的接口`MongoCollection`和`MongoDatabase`，用来完成此框架不支持的功能。框架内的部分接口也接受的`Bson`参数，你可以用mongodb原生驱动的`Filters`写过滤条件，用`Projections`写字段选择等。
+
+#### 在spring中配置和使用
+##### 引用jar包
+```
+<dependency>
+	<groupId>com.mountsea.django</groupId>
+	<artifactId>django</artifactId>
+	<version>3.2.0</version>
+</dependency>
+```
+##### 配置
+```yaml
+django:
+  dataSources:
+    dev: # 此处是dataSource命名，在daoFactories配置中被引用
+      connectionString: mongodb://127.0.0.1:27017
+  daoFactories:
+    global: # factory的名字，接下来创建dao接口的时候需要引用，一个factory包含一组配置
+      dataSourceName: dev
+      database: my_database
+      enableCache: false
+```
+##### 注入接口对象
+在main类上加上`EnableDjango`注解
+```java
+@EnableDjango
+@SpringBootApplication
+public class MainApplication {...}
+```
+在组件上使用`DjangoInject`注解注入接口对象
+```
+@DjangoInject
+private DatabaseDao dao;
+```
+注入时默认使用`global` factory的配置，还可以选择其他的factory，如 `@ DjangoInject(factory = "logging")`，这里引用的factory必须是在配置文件中配置过的。
+#### 一个游戏服务器中的典型应用场景
+一般游戏服务器存储的数据，结构定义繁多，子文档使用比较多，对存储结构灵活性需求比较高。各模块的数据之间相对独立，对关联查询的需求不高，因此很适合用mongodb。
+
+这里举一个游戏服务器的玩家背包存储的例子，我们把玩家各种拥有的各种道具存储在背包里面，比如玩家的装备。
+
+这个例子主要描述文档的基本操作以及文档对象记录修改功能，文档类的定义涉及一些类型机制方面的问题，这里可以先不深究，下文有详细文档。
+##### 文档类的定义
+```java
+import com.mountsea.django.bson.projection.DocumentNode;
+import lombok.Getter;
+import lombok.Setter;
+
+/**
+ * 背包文档类，继承了CollectibleDocument，表示Bag类对应于一个mongodb的collection，默认collection的名字和类名相同
+ */
+@Getter
+@Setter
+public class Bag extends CollectibleDocument {
+    public static Bag create() {
+        return create(Bag.class);
+    }
+
+    private String id;
+
+    //在一个map中存储equip，map的key是equipId
+    private DocumentMap<Integer, Equip> equips;
+}
+```
+```java
+import com.mountsea.django.bson.projection.DocumentNode;
+import lombok.Getter;
+import lombok.Setter;
+
+/**
+ * 装备文档类
+ */
+@Getter
+@Setter
+public class Equip extends DocumentNode {
+    public static Equip create() {
+        return create(Equip.class);
+    }
+
+    protected Equip() {
+    }
+
+    private int equipId;
+
+    private int level;
+
+    private String name;
+}
+```
+从类定义上面，可以看到文档对象的创建方式和字段类型是有限制的，创建对象最终要调用`DocumentNode.create()`方法，我们给每个文档类上加上一个静态的create方法，DocumentMap是Map接口的一个实现类。
+
+##### 文档类的基本操作
+```java
+@SpringBootApplication
+@EnableDjango
+public class MainApplication implements CommandLineRunner {
+
+    public static void main(String[] args) {
+        SpringApplication.run(MainApplication.class, args);
+    }
+
+    @DjangoInject
+    DatabaseDao dao;
+
+    @Override
+    public void run(String... args) throws Exception {
+        //创建equip对象
+        Equip equip = Equip.create();
+        equip.setName("麻痹戒指");
+        equip.setEquipId(1);
+        equip.setLevel(1);
+        
+        Equip equip2 = Equip.create();
+        equip2.setName("屠龙宝刀");
+        equip2.setEquipId(2);
+        equip2.setLevel(1);
+		
+		//创建bag对象，并把equip对象put到bag
+        Bag bag = Bag.create();
+        bag.setId("player1");
+        bag.setEquips(new DocumentMap<>());
+        bag.getEquips().put(equip.getEquipId(), equip);
+        bag.getEquips().put(equip2.getEquipId(), equip2);
+
+		//保存bag文档，所以执行的是 insert
+        dao.saveByKey(bag);
+
+		//更新equip的level
+        equip.setLevel(2);
+		
+		//再次保存bag文档，此时是部分更新，执行的是 update({_id:"player1", {$set: {'equips.1.level': 2}}})
+        dao.saveByKey(bag);
+
+		//查找bag文档, Bag类没有定义key，默认id就是key，也就是根据id查找
+        Bag find = dao.findByKey(Bag.class, "player1");
+        assert find != null;
+        assert find.getEquips().get(1).getLevel() == 2;
+
+		//删除bag文档
+        boolean delete = dao.deleteByKey(bag);
+        assert delete;
+    }
+}
+```
+需要注意的是，在`equip.setLevel(2)`之后，再次保存bag对象，是部分更新，只更新`equips.1.level`字段，因为从上次save之后，只有这个字段值被修改了。
+
+**save系列方法的语义是把文档对象和数据库同步，应用层不必关心实际是部分更新还是完全更新，save成功之后文档对象和数据库中就是一致的。**
+
+#### 为什么使用django-java
+"部分更新"功能提升了更新文档的性能，但是为了实现这个功能，我们定义文档类时要用专用的类型系统。
+如果你熟悉sql数据库，也许会想部分更新功能有点"黑科技"了，还可以有其他的替代方案，所以有必要来和其他方案做一些对比。还是用前面存储背包的例子。
+
+##### 对比一：始终更新整个文档
+我们首先要问的是，在mongodb中更新一个文档，部分更新是否比完全更新有更好的性能？
+答案是肯定的，部分更新的优势有以下几方面：
+- WiredTiger引擎在内存中缓存page，并使用MVCC控制单文档的读写，内部实现上使用skip list存储文档的多个更新记录，如果是部分更新，这些记录占用的内存空间会更小。
+- Mongodb使用journal机制来平衡持久化和性能之间的矛盾，部分更新的记录在journal中占用的内存空间更小。
+- 在副本集中，部分更新记录的 replication oplog size更小。
+- 在分片集群中，部分更新操作在mongos节点上消耗更少的CPU。
+- 部分更新产生更少的网络流量。
+
+占用更小的内存，就意味着服务器有更多的内存缓存空间，从而提升性能。
+
+如果一个文档本来只有很少的几个字段，始终完全更新也是可行的，但是有些文档中会存储Map等容器，文档的大小会在一定范围内增长，最后为了性能考虑，不得不考虑拆分文档，或者使用部分更新。
+
+##### 对比二：把文档拆分成更细的结构
+如果完全更新整个文档有性能顾虑，那么把文档拆分成更小的结构，存放在多个collection中也是一种选择。
+
+比如前面Bag的示例，可以把Equip和Bag分两个collection存储，在Bag中存储Equip的Id。
+
+这就是使用sql数据库时的典型做法。它的问题就在于，写代码更麻烦，我们要查询Bag和Equip两张表，把对象组合起来，并在执行业务时记录哪些Equip需要保存。由于分开两张表存储，还增加了出现数据不一致bug的可能性。这种做法实际上是用开发效率换性能，没有利用到mongodb的文档存储的优势。
+
+##### 对比三：手动编写更新语句
+我们仍然把Equip存储在Bag文档中，但是手动记录哪些Equip需要更新，并在save时，手动使用`com.mongodb.client.model.Updates`来编写更新子文档的语句。
+emm.. 为什么不考虑用一个能把这些简化的框架呢？
+
+**django-java的部分更新功尤其适用于文档更新操作比较频繁的场景。**
+
+## 文档部分
+
+### 文档类的定义
+#### 类型结构
+`DocumentNode`是所有文档类的父类，包括根文档类 (有直接对应的collection)，子文档类和容器文档类。如果你看到一个类继承了`DocumentNode`，那么就知道这是个"数据层"的类。
+
+![类型结构](http://10.17.172.74:4999/server/../Public/Uploads/2021-01-10/5ffa5232a619e.png)
+
+根文档类有对应的mongodb collection，通过继承`CollectibleDocument`来区分根文档类。比如前面示例中的`Bag`类就是根文档类，`Equip`类就是子文档类。根文档类需要实现一个`getId()`方法。**下文把子文档类和根文档类统称为文档类.**
+
+根文档类默认对应collection的名字就是类名，也可用`com.mountsea.django.core.annotation.CollectionName`注解来修改collection名。
+
+**文档类的字段分为3种类型，分别是子文档类、容器类、不可变类型。**其中容器类只能用框架内置的类型。不可变类型是常见的值类型比如`int`、`String`等，还包括自定义的不可变类型。这些下文再做详细介绍。如果文档类定义了不属于这3种类型的字段，在创建对象时就会抛出异常，这种检查是递归的，文档的子文档的字段，容器字段的元素类型，都会被检查。
+
+由于使用了这样的类型系统，对一个根文档内部做的任何修改，都是可以被监听到的。在整个文档的树结构中，我们让所有子文档和子容器都持有一个它的直接上级的弱引用(`WeakRefrence`)，当修改子文档和子容器的时候，会逐级向上通知，最后修改信息被根文档收集起来。（收集的修改信息是可以相互覆盖或剪枝的，不会无限增长或占用过多空间）
+
+文档类的对象实际上是通过CGLib创建的代理对象，更多的解释请查看原理部分。
+
+#### 文档类的限制
+文档类对象实际是通过CGLib创建的代理类对象，所以在定义和使用时有一些限制和规范。
+
+##### 创建对象
+创建文档类对象时，要通过`DocumentNode#create(java.lang.Class)`方法创建，如果直接使用`new`关键字创建将会抛出运行时异常。建议是在每个文档类上加上一个静态的`create`方法，也可以进一步把构造方法设为`protected`（需要被代理类继承，不能是`private`）。
+还可以在IDE中设置代码模板来快速定义`create`方法，Intellj Idea的设置可以参考[这里]()。
+
+定义`create`方法：
+```java
+import com.mountsea.django.core.CollectibleDocument;
+
+public class Bag extends CollectibleDocument {
+	//在每个文档类中定义静态的create方法
+    public static Bag create() {
+		//实际调用DocumentNode#create方法
+        return create(Bag.class);
+    }
+	
+    protected Bag() {
+    }
+}
+```
+```
+ Bag bag = Bag.create(); // 通过create方法创建对象
+```
+##### 构造方法
+文档类要有无参构造方法。
+
+##### 属性定义
+文档类的属性定义，必须同时有字段、set方法、get方法。不符合条件的字段在编码时会被忽略。建议使用lombok的`lombok.Getter`和`lombok.Setter`注解创建getter和setter。
+
+setter和getter应该尽量简单，不能在一个setter中调用另一个setter、在getter中调用setter等。
+
+不能直接使用字段赋值，只能通过set方法赋值。但在字段初始化和构造方法中可以对字段赋值。
+
+##### 其他限制
+同一个`DocumentNode`对象，不能同时赋值给多个父节点，否则赋值时将抛出异常。如果有这样的需求，应该先`deepCloneSelf`复制一个自身对象。
+
+```
+import com.mountsea.django.bson.projection.DocumentNode;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+class Sheath extends DocumentNode {
+    private Equip equip;
+}
+
+@Getter
+@Setter
+class Equip extends DocumentNode {
+}
+```
+```
+Sheath sheath1 = Sheath.create(Sheath.class);
+Sheath sheath2 = Sheath.create(Sheath.class);
+Equip equip = Equip.create(Equip.class);
+
+sheath1.setEquip(equip); // 赋值后equip已有父节点
+// sheath2.setEquip(equip); // 错误，抛出 MultiParentException
+
+sheath2.setEquip(equip.deepCloneSelf()); // 正确，先复制一个自身
+
+sheath1.setEquip(null); // 赋值后equip已没有父节点
+sheath2.setEquip(equip); // 可以
+```
+如果允许一个文档类对象有多个父节点，那么修改一个对象，将会影响到多个父文档对象，这可能导致意外的结果。所以我们禁止一个文档类对象有多个父节点。
+
+##### 关于限制
+总得来说，文档类看起来有比较多的限制，但是实际上数据层的类和普通的类性质是不一样的。数据层的类只是一个定义数据结构的作用。有些限制是不管用什么框架都应该遵守的。
+
+#### 不可变类型
+不可变类型是文档类的3个可用字段类型之一。不可变是指对象内部的值不会变化，不可变类型包括：
+- primitive和primitive的包装器类型(int、Integer等)
+- 一些已知的值类型(String、Date、BsonInt、ObjectId、枚举等等)
+- 以及自定义的不可变类型。
+
+框架内部使用`GlobalModels.isImmutableType(Class)`方法，可以判断一个类是否不可变类型，对于自定义的类型，被判断过一次之后，结果会缓存起来。
+
+##### 自定义不可变类型
+```
+import lombok.Data;
+import org.bson.codecs.pojo.annotations.BsonCreator;
+import org.bson.codecs.pojo.annotations.BsonProperty;
+
+//Vector的字段都是final的
+@Data
+public class Vector {
+    
+    private final int x;
+    private final int y;
+
+    @BsonCreator
+    public Vector(@BsonProperty("x") int x, @BsonProperty("y") int y) {
+        this.x = x;
+        this.y = y;
+    } 
+}
+```
+**自定义不可变类型没有可写的属性**。在上面的`Vector`类定义中我们字段全部设为final，并在构造方法上添加`BsonCreator`注解，以及在方法参数上添加`BsonProperty`注解，这两个注解是来自`org.mongodb:bson`库的。
+
+除此之外还有其他两种定义不可变类型的方法，一是使用`com.mountsea.django.bson.annotation.ImmutableDocument`注解，如果一个类有`ImmutableDocument`注解，就会被当做不可变类型处理。二是使用`GlobalModels#regImmutableType(Class, boolean)`方法注册不可变类型，注册要最先执行，在创建对象前执行。
+
+#### 容器节点类型
+容器节点类型是文档类的3种可用字段类型之一。其中包括：
+
+| 容器节点类 | 接口 |  内部实现 | 特性说明 |
+| ------------ | ------------  | ------------ |  ------------ |
+|   DocumentList | List |  ArrayList | 常用的List |
+|   LinkedDocumentList | List/Deque |  LinkedList | 链表List|
+|   CopyOnWriteDocumentList | List |  CopyOnWriteList | 具有和CopyOnWriteList一样的并发特性|
+|   DocumentMap | Map |  HashMap | 常用的Map |
+|   TreeDocumentMap | NavigableMap|  TreeMap | 排序Map |
+|   LinkedDocumentMap | Map | LinkedHashMap | 有序Map |
+|   ConcurrentDocumentMap | ConcurrentMap |  ConcurrentHashMap | 并发安全Map |
+|   DocumentSet | Set |  HashSet | 常用的Set |
+|   TreeDocumentSet  | NavigableSet |  TreeSet | 排序Set |
+|   LinkedDocumentSet | Set |  LinkedHashSet | 有序Set |
+|   ConcurrentDocumentSet | Set |  ConcurrentHashMap | 并发安全Set |
+
+容器节点类也是`DocumentNode`的子类。但是容器对象不是CGLib的代理对象，创建容器对象可以用`new`关键字。容器类对所有接口方法做了完整的监听，你可以使用容器的所有方法。
+
+```
+TreeDocumentMap<Integer, Integer> map = new TreeDocumentMap<>();
+map.computeIfAbsent(1, k -> k + 1); // 修改map
+
+for (Map.Entry<Integer, Integer> entry : map.entrySet()) {
+	entry.setValue(0); // 修改map
+}
+
+map.headMap(1).remove(1); // 修改map
+```
+上述示例接口调用都是允许的，修改动作都可以被监听到，如果map是被一个根文档持有的，那么这些修改将会被记录。
+
+##### Map的key类型
+
+Map映射为mongodb文档的子文档，所以Map的key要能够和String相互转换。
+框架内置了对`String`/`Integer`/`Long`/`ObjectId`等类型的支持，Map的key可以直接使用这些类型。
+
+如果要使用其他类型的key，可以通过`GlobalModels#regMapStringKeyConverter`方法注册。如果是自己写的类，还可以通过实现`MapStringKeyConvertable`接口，来定义转换到String的方法，后者是建议优先使用的。
+
+Map的key必须是不可变类型。
+
+#### 文档类的其他功能
+##### deepCloneSelf方法
+调用`DocumentNode#deepCloneSelf()`，对当前文档对象执行深复制。
+
+##### 注解
+`org.mongodb:bson`库中的部分注解在文档类或自定义不可变类型中也可用。
+- `org.bson.codecs.pojo.annotations.BsonIgnore`，如果一个属性的getter/setter/字段任一地方有此注解，那么忽略此属性。
+- `org.bson.codecs.pojo.annotations.BsonProperty`，可以用在字段上，修改对应bson文档的字段名。在定义不可变类的构造方法的参数中也用到。
+- `org.bson.codecs.pojo.annotations.BsonCreator`，在定义不可变类的构造方法时用到。
+
+### 保存和更新文档
+
+#### save方法的语义
+保存和更新文档主要使用save方法，save方法有`savebyKey`/`saveByFields`/`bulkSaveByKey`/`bulkSaveByFields`4个。
+
+save方法都接受文档类对象做为参数之一，**save方法的语义是把文档对象和数据库同步**，应用层不必关心实际是部分更新还是完全更新，save成功之后文档对象和数据库中就是一致的。
+
+**save方法提供文档对象级别的并发安全**，多个线程同时修改并save同一个文档，可保证最终文档和数据库中一致。如果是修改容器字段，使用者需要考虑容器本身的并发安全，不能在并发环境下使用非并发安全的容器。比如说并发环境下应该使用`ConcurrentDocumentMap`替换`DocumentMap`。
+如果是调用批量save方法`bulkSaveByKey`/`bulkSaveByFields`，不保证并发安全，如果多个线程同时对相同的对象调用了批量save方法，在检测到竞争条件时，方法将会抛出异常，一般来说批量save没有并发的需求。
+
+#### save方法的使用
+save方法都有一个可选参数`SaveMode`：
+
+|  SaveMode | 说明  | mongodb操作 |
+| ------------ | ------------ |
+| `INSERT_OR_UPDATE`  |  默认参数。更新或插入，如果数据库中不存在此文档，则新增插入，否则是更新。 | update，加upsert选项 |
+| `INSERT_ONLY`  |  仅插入文档，如果文档已存在，则抛出异常。 | insert |
+| `UPDATE_ONLY`  |  仅更新文档，如果文档存在则更新，否则什么都不做。 | update |
+
+save方法返回`SaveResult`对象，可以通过返回值判断是否插入或更新了文档。
+
+save方法有4个：
+
+|  方法 |  说明 | mongodb操作 |
+| ------------ | ------------ |
+|  `savebyKey`  |  根据key保存文档 | insert时插入整个文档，update时使用文档的key做为filter  |
+|  `saveByFields` | 根据指定字段保存文档 | insert时插入整个文档，update时使用指定字段做为filter  |
+|  `bulkSaveByKey` | 根据key批量保存 | `savebyKey`的批量操作，使用mongodb驱动的`bulkWrite`方法 |
+|  `bulkSaveByFields` | 根据指定字段批量保存 |  `saveByFields`的批量操作，使用mongodb驱动的`bulkWrite`方法  |
+
+关于方法参数和更多方法说明请查看接口文档或方法注释。
+
+#### update的内容
+
+save方法中，如果对应的操作是insert，那么插入的内容是整个文档。
+
+如果对应的操作是update，update的filter已在上表已说明，update的内容是文档上所记录的更新。如果文档不在记录更新状态，则更新内容是整个文档。关于文档的记录更新状态请查看[原理部分]()。
+
+#### 其他的操作方法
+除了save方法，要写入文档还有其他的方法可用，比如`DatebaseDao#updateOne` / `DatebaseDao#updateMany`等，调用时需要手动使用mongodb驱动提供的`Filters`/`Updates`来拼接出操作语句。
+
+### 文档类的key
+
+文档类的key用于表示文档的唯一索引。key可以包含一个或多个字段。key在使用`DatabaseDaoDao`中的一些方法时用到，比如调用`findByKey`/`getByKey`方法，需要传key的值。使用`saveByKey`方法，需要根据key的定义和文档对象来自动生成update操作的filter。
+
+在文档类上使用`KeyField`/`KeyClass` 两种注解可以定义key。
+
+如果没有通过注解定义key，则默认id就是key。id是key的时候可以省去key的定义。如果是多层继承的类，查找key注解时先在子类中查找，如果子类中没有再从父类中查找。优先使用子类中的注解。
+
+
+#### KeyField注解
+**当根文档仅有一个key字段时使用`com.mountsea.django.core.annotation.KeyField`注解。**
+在根文档的字段上加上 `KeyField`注解，表示一个字段是key，不能在多个字段上同时用`KeyField`注解。key字段的类型不限，比如key字段可以是一个primitive类型，也可以是一个自定义不可变类型。
+
+调用`findByKey`/`getByKey`方法时，传递的key值的类型是key字段的类型。
+
+#### KeyClass注解
+**当根文档有多个字段共同组成key时，使用`com.mountsea.django.core.annotation.KeyClass`注解。**
+使用`KeyClass`注解要定义一个单独的key类型。
+
+```
+import com.mountsea.django.core.CollectibleDocument;
+import com.mountsea.django.core.annotation.KeyClass;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+@KeyClass(Bag.Key.class)
+public class Bag extends CollectibleDocument {
+    
+    @Data
+    public static class Key {
+        private int bagId;
+        private int playerId;
+    }
+
+    private String id;
+    private int bagId;
+    private int playerId;
+}
+```
+如上述示例，Key是一个单独定义的类，其中的字段类型和字段名必须与根文档一致。
+
+调用`findByKey`/`getByKey`方法时，传递的key值是"KeyClass"的对象。
+
+##### KeyClass注解改成KeyField注解
+我们还可以修改文档的设计，把多个key字段放在一个类里面，key就变成了根文档中的单个字段，然后不再需要`KeyClass`注解，而是用`KeyField`注解。如果有key有多个字段，这种设计是更直观的。
+
+比如对前面的示例做修改：
+```
+import com.mountsea.django.core.CollectibleDocument;
+import com.mountsea.django.core.annotation.KeyField;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class Bag extends CollectibleDocument {
+
+    @KeyField
+    private BagKey id;
+}
+
+@Data
+class BagKey {
+    private final int bagId;
+
+    private final int playerId;
+
+    @BsonCreator
+    public BagKey(@BsonProperty("bagId") int bagId, @BsonProperty("playerId") int playerId) {
+        this.bagId = bagId;
+        this.playerId = playerId;
+    }
+}
+
+```
+
+### API概述
+- `com.mountsea.django.core.DatabaseDao`提供数据库操作API。在spring boot中可以用`DjangoInject`注解注入`DatabaseDao`。
+
+- `com.mountsea.django.core.DjangoDaoFactory`提供配置和创建`DatabaseDao`的方法。在spring boot中可以用`DjangoInject`注解注入`DjangoDaoFactory`。
+
+- `com.mountsea.django.bson.BsonUtils`提供一些工具方法，比如文档类和`BsonDocument`转换，文档类和json转换等。
+
+- `com.mountsea.django.bson.projection.pojo.GlobalModels`提供注册和查询类型信息的方法。
+
+这里只提供方法的简单描述，详细文档请查看方法注释或接口文档。
+
+#### key相关的方法
+
+以下是`DatabaseDao`的部分方法。
+
+|  方法名 | 参数  |  说明 |
+| ------------ | ------------ | ------------ |
+| findByKey  | 文档类Class对象、key值 | 根据key查找，不存在则返回null  |
+| getByKey | 文档类Class对象、key值 | 根据key查找，不存在则根据key初始化插入，不会返回null  |
+| saveByKey  | 文档类对象 | 见"保存和更新文档"部分 |
+| bulkSaveByKey  | 文档类对象 | 见"保存和更新文档"部分 |
+| deleteByKey  | 文档类Class对象、key值 | 根据key删除文档 |
+| deleteByKey  | 文档类对象| 根据key删除文档 |
+
+#### 其他数据库操作的方法
+以下是`DatabaseDao`的部分方法。
+
+|  方法名 | 参数  |  说明 |
+| ------------ | ------------ | ------------ |
+| findAll  | 文档类Class对象、Bson filter、Bson project、分页、排序等 | 查找条件查找所有文档，返回文档对象的List  |
+| findOne | 文档类Class对象、Bson filter、Bson project | 根据条件查找单个文档  |
+| deleteOne  | 文档类Class对象、Bson filter | 根据条件删除单个文档|
+| deleteMany  | 文档类Class对象、Bson filter | 根据条件删除多个文档 |
+| updateOne  | 文档类Class对象、Bson filter、Bson update、UpdateOptions | 根据条件更新单个文档 |
+| updateMany  | 文档类Class对象、Bson filter、Bson update、UpdateOptions | 根据条件更新多个文档 |
+| saveByFields  | 文档类对象、字段名List | 见"保存和更新文档"部分 |
+| bulkSaveByFields  |  文档类对象、字段名List | 见"保存和更新文档"部分 |
+| getMongoDatabase  |    | 获取mongodb驱动的`MongoDatabase`对象 |
+| getMongoCollection  | 文档类Class对象   | 获取mongodb驱动的`MongoCollection`对象 |
+
+
+#### 并发控制相关的方法
+以下是`DatabaseDao`的部分方法。
+
+|  方法名 | 参数  |  说明 |
+| ------------ | ------------ | ------------ |
+| casUpdateByVersion  | 文档类对象、version字段名 | 单文档CAS更新。如果数据库中version字段和当前对象一致，则更新成功并返回true，如果version字段不一致，则不改变文档并返回false。<br> 实现上是使用`findOneAndUpdate`命令，只请求一次数据库。<br> 可以用`VersionField`注解来标注默认的version字段。 |
+| atomicIncAndGetField  | 文档类Class对象、文档id、自增字段名、增量 | 对文档的一个字段进行原子自增，并返回自增后的值。<br>实现上使用`$inc`操作符。 |
+
+
+#### session和事务相关方法
+
+使用`DatabaseDao#withNewSessionTransaction`方法自动开启session和事务，在事务中执行`TransactionRunner`参数中的动作，并提交或回滚事务，最后close session。
+
+示例如下：
+```
+    @DjangoInject
+    DatabaseDao dao;
+
+    private void runTx() {
+	    //创建匿名函数做为TransactionRunner
+        dao.withNewSessionTransaction(sessionDao -> {
+            Bag bag1 = Bag.create();
+            Bag bag2 = Bag.create();
+            bag1.setId("1");
+            bag2.setId("2");
+			//在事务中执行两次save
+            sessionDao.saveByKey(bag1);
+            sessionDao.saveByKey(bag2);
+            return null;
+        }, null, null);
+    }
+
+```
+
+在`TransactionRunner`调用的dao接口是`DatabaseDaoWithSession`类对象，而不是原来的`DatabaseDao`对象。
+
+`DatabaseDaoWithSession`继承了`DatabaseDao`，不同的是它绑定了一个session，调用所有数据库操作方法，都会使用绑定的session。`DatabaseDaoWithSession`需要手动`close`。
+
+还可以通过`DatabaseDaoFactory`来手动创建绑定了session的`DatabaseDaoWithSession`。
+
+### 文档缓存
+`DatabaseDao`支持文档缓存，
+
